@@ -1,7 +1,7 @@
 /*
   support_command.ino - command support for Tasmota
 
-  Copyright (C) 2019  Theo Arends
+  Copyright (C) 2020  Theo Arends
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -87,6 +87,15 @@ void ResponseCmndDone(void)
 void ResponseCmndIdxChar(const char* value)
 {
   Response_P(S_JSON_COMMAND_INDEX_SVALUE, XdrvMailbox.command, XdrvMailbox.index, value);
+}
+
+void ResponseCmndAll(uint32_t text_index, uint32_t count)
+{
+  mqtt_data[0] = '\0';
+  for (uint32_t i = 0; i < count; i++) {
+    ResponseAppend_P(PSTR("%c\"%s%d\":\"%s\""), (i) ? ',' : '{', XdrvMailbox.command, i +1, SettingsText(text_index +i));
+  }
+  ResponseJsonEnd();
 }
 
 /********************************************************************************************/
@@ -1220,16 +1229,20 @@ void CmndIpAddress(void)
 
 void CmndNtpServer(void)
 {
-  if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= 3)) {
-    uint32_t ntp_server = SET_NTPSERVER1 + XdrvMailbox.index -1;
-    if (XdrvMailbox.data_len > 0) {
-      SettingsUpdateText(ntp_server,
-        (SC_CLEAR == Shortcut()) ? "" : (SC_DEFAULT == Shortcut()) ? (1 == XdrvMailbox.index) ? NTP_SERVER1 : (2 == XdrvMailbox.index) ? NTP_SERVER2 : NTP_SERVER3 : XdrvMailbox.data);
-      SettingsUpdateText(ntp_server, ReplaceCommaWithDot(SettingsText(ntp_server)));
-//        restart_flag = 2;  // Issue #3890
-      ntp_force_sync = true;
+  if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= MAX_NTP_SERVERS)) {
+    if (!XdrvMailbox.usridx) {
+      ResponseCmndAll(SET_NTPSERVER1, MAX_NTP_SERVERS);
+    } else {
+      uint32_t ntp_server = SET_NTPSERVER1 + XdrvMailbox.index -1;
+      if (XdrvMailbox.data_len > 0) {
+        SettingsUpdateText(ntp_server,
+          (SC_CLEAR == Shortcut()) ? "" : (SC_DEFAULT == Shortcut()) ? (1 == XdrvMailbox.index) ? NTP_SERVER1 : (2 == XdrvMailbox.index) ? NTP_SERVER2 : NTP_SERVER3 : XdrvMailbox.data);
+        SettingsUpdateText(ntp_server, ReplaceCommaWithDot(SettingsText(ntp_server)));
+  //        restart_flag = 2;  // Issue #3890
+        ntp_force_sync = true;
+      }
+      ResponseCmndIdxChar(SettingsText(ntp_server));
     }
-    ResponseCmndIdxChar(SettingsText(ntp_server));
   }
 }
 
@@ -1251,14 +1264,18 @@ void CmndAp(void)
 
 void CmndSsid(void)
 {
-  if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= 2)) {
-    if (XdrvMailbox.data_len > 0) {
-      SettingsUpdateText(SET_STASSID1 + XdrvMailbox.index -1,
-              (SC_CLEAR == Shortcut()) ? "" : (SC_DEFAULT == Shortcut()) ? (1 == XdrvMailbox.index) ? STA_SSID1 : STA_SSID2 : XdrvMailbox.data);
-      Settings.sta_active = XdrvMailbox.index -1;
-      restart_flag = 2;
+  if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= MAX_SSIDS)) {
+    if (!XdrvMailbox.usridx) {
+      ResponseCmndAll(SET_STASSID1, MAX_SSIDS);
+    } else {
+      if (XdrvMailbox.data_len > 0) {
+        SettingsUpdateText(SET_STASSID1 + XdrvMailbox.index -1,
+                (SC_CLEAR == Shortcut()) ? "" : (SC_DEFAULT == Shortcut()) ? (1 == XdrvMailbox.index) ? STA_SSID1 : STA_SSID2 : XdrvMailbox.data);
+        Settings.sta_active = XdrvMailbox.index -1;
+        restart_flag = 2;
+      }
+      ResponseCmndIdxChar(SettingsText(SET_STASSID1 + XdrvMailbox.index -1));
     }
-    ResponseCmndIdxChar(SettingsText(SET_STASSID1 + XdrvMailbox.index -1));
   }
 }
 
@@ -1308,16 +1325,20 @@ void CmndWifiConfig(void)
 void CmndFriendlyname(void)
 {
   if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= MAX_FRIENDLYNAMES)) {
-    if (XdrvMailbox.data_len > 0) {
-      char stemp1[TOPSZ];
-      if (1 == XdrvMailbox.index) {
-        snprintf_P(stemp1, sizeof(stemp1), PSTR(FRIENDLY_NAME));
-      } else {
-        snprintf_P(stemp1, sizeof(stemp1), PSTR(FRIENDLY_NAME "%d"), XdrvMailbox.index);
+    if (!XdrvMailbox.usridx) {
+      ResponseCmndAll(SET_FRIENDLYNAME1, MAX_FRIENDLYNAMES);
+    } else {
+      if (XdrvMailbox.data_len > 0) {
+        char stemp1[TOPSZ];
+        if (1 == XdrvMailbox.index) {
+          snprintf_P(stemp1, sizeof(stemp1), PSTR(FRIENDLY_NAME));
+        } else {
+          snprintf_P(stemp1, sizeof(stemp1), PSTR(FRIENDLY_NAME "%d"), XdrvMailbox.index);
+        }
+        SettingsUpdateText(SET_FRIENDLYNAME1 + XdrvMailbox.index -1, ('"' == XdrvMailbox.data[0]) ? "" : (SC_DEFAULT == Shortcut()) ? stemp1 : XdrvMailbox.data);
       }
-      SettingsUpdateText(SET_FRIENDLYNAME1 + XdrvMailbox.index -1, ('"' == XdrvMailbox.data[0]) ? "" : (SC_DEFAULT == Shortcut()) ? stemp1 : XdrvMailbox.data);
+      ResponseCmndIdxChar(SettingsText(SET_FRIENDLYNAME1 + XdrvMailbox.index -1));
     }
-    ResponseCmndIdxChar(SettingsText(SET_FRIENDLYNAME1 + XdrvMailbox.index -1));
   }
 }
 
@@ -1373,6 +1394,11 @@ void CmndInterlock(void)
           SetDevicePower(power, SRC_IGNORE);                    // Remove multiple relays if set
         }
       }
+#ifdef USE_SHUTTER
+      if (Settings.flag3.shutter_mode) {  // SetOption80 - Enable shutter support
+        ShutterInit(); // to update shutter mode
+      }
+#endif  // USE_SHUTTER
     }
     Response_P(PSTR("{\"" D_CMND_INTERLOCK "\":\"%s\",\"" D_JSON_GROUPS "\":\""), GetStateText(Settings.flag.interlock));
     uint32_t anygroup = 0;

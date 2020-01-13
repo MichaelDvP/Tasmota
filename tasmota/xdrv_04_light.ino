@@ -1,7 +1,7 @@
 /*
   xdrv_04_light.ino - PWM, WS2812 and sonoff led support for Tasmota
 
-  Copyright (C) 2019  Theo Arends
+  Copyright (C) 2020  Theo Arends
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -79,6 +79,7 @@
  *  .b For white bulbs with Cold/Warm colortone, use changeCW() or changeCT()
  *     to change color-tone. Set overall brightness separately.
  *     Color-tone temperature can range from 153 (Cold) to 500 (Warm).
+ *     SetOption82 can expand the rendering from 200-380 due to Alexa reduced range.
  *     CW channels are stored at full brightness to avoid rounding errors.
  *  .c Alternatively, you can set all 5 channels at once with changeChannels(),
  *     in this case it will also set the corresponding brightness.
@@ -160,6 +161,13 @@ struct LCwColor {
 const uint8_t MAX_FIXED_COLD_WARM = 4;
 const LCwColor kFixedColdWarm[MAX_FIXED_COLD_WARM] PROGMEM = { 0,0, 255,0, 0,255, 128,128 };
 
+// CT min and max
+const uint16_t CT_MIN = 153;          // 6500K
+const uint16_t CT_MAX = 500;          // 2000K
+// Ranges used for Alexa
+const uint16_t CT_MIN_ALEXA = 200;    // also 5000K
+const uint16_t CT_MAX_ALEXA = 380;    // also 2600K
+
 // New version of Gamma correction compute
 // Instead of a table, we do a multi-linear approximation, which is close enough
 // At low levels, the slope is a bit higher than actual gamma, to make changes smoother
@@ -185,9 +193,8 @@ const gamma_table_t gamma_table[] = {   // don't put in PROGMEM for performance 
 
 // simplified Gamma table for Fade, cheating a little at low brightness
 const gamma_table_t gamma_table_fast[] = {
-  {     0,      0 },
-  {   384,     67 },
-  {   768,    467 },
+  {   384,    192 },
+  {   768,    576 },
   {  1023,   1023 },
   { 0xFFFF, 0xFFFF }          // fail-safe if out of range
 };
@@ -264,6 +271,7 @@ struct LIGHT {
   bool update = true;
   bool pwm_multi_channels = false;        // SetOption68, treat each PWM channel as an independant dimmer
 
+  bool     fade_initialized = false;      // dont't fade at startup
   bool     fade_running = false;
   uint16_t fade_start_10[LST_MAX] = {0,0,0,0,0};
   uint16_t fade_cur_10[LST_MAX];
@@ -273,6 +281,16 @@ struct LIGHT {
 } Light;
 
 power_t LightPower(void)
+{
+  return Light.power;                     // Make external
+}
+
+// IRAM variant for rotary
+#ifndef ARDUINO_ESP8266_RELEASE_2_3_0      // Fix core 2.5.x ISR not in IRAM Exception
+power_t LightPowerIRAM(void) ICACHE_RAM_ATTR;
+#endif  // ARDUINO_ESP8266_RELEASE_2_3_0
+
+power_t LightPowerIRAM(void)
 {
   return Light.power;                     // Make external
 }
@@ -334,12 +352,19 @@ class LightStateClass {
     uint8_t  _b = 255;  // 0..255
 
     uint8_t  _subtype = 0;  // local copy of Light.subtype, if we need multiple lights
-    uint16_t _ct = 153;  // 153..500, default to 153 (cold white)
+    uint16_t _ct = CT_MIN;  // 153..500, default to 153 (cold white)
     uint8_t  _wc = 255;  // white cold channel
     uint8_t  _ww = 0;    // white warm channel
     uint8_t  _briCT = 255;
 
     uint8_t  _color_mode = LCM_RGB; // RGB by default
+    // the CT range below represents the rendered range,
+    // This is due to Alexa whose CT range is 199..383
+    // Hence setting Min=200 and Max=380 makes Alexa use the full range
+    // Please note that you can still set CT to 153..500, but any
+    // value below _ct_min_range or above _ct_max_range not change the CT
+    uint16_t _ct_min_range = CT_MIN;   // the minimum CT rendered range
+    uint16_t _ct_max_range = CT_MAX;   // the maximum CT rendered range
 
   public:
     LightStateClass() {
@@ -357,7 +382,7 @@ class LightStateClass {
     //   LST_COLDWARM:  LCM_CT
     //   LST_RGB:       LCM_RGB
     //   LST_RGBW:      LCM_RGB, LCM_CT or LCM_BOTH
-    //   LST_RGBWC:     LCM_RGB, LCM_CT or LCM_BOTH
+    //   LST_RGBCW:     LCM_RGB, LCM_CT or LCM_BOTH
     uint8_t setColorMode(uint8_t cm) {
       uint8_t prev_cm = _color_mode;
       if (cm < LCM_RGB) { cm = LCM_RGB; }
@@ -377,7 +402,7 @@ class LightStateClass {
           break;
 
         case LST_RGBW:
-        case LST_RGBWC:
+        case LST_RGBCW:
           _color_mode = cm;
           break;
       }
@@ -488,8 +513,23 @@ class LightStateClass {
       return BriToDimmer(bri);
     }
 
-    inline uint16_t getCT() {
-      return _ct; // 153..500
+    inline uint16_t getCT() const {
+      return _ct; // 153..500, or CT_MIN..CT_MAX
+    }
+
+    // get the CT value within the range into a 10 bits 0..1023 value
+    uint16_t getCT10bits() const {
+      return changeUIntScale(_ct, _ct_min_range, _ct_max_range, 0, 1023);
+    }
+
+    inline void setCTRange(uint16_t ct_min_range, uint16_t ct_max_range) {
+      _ct_min_range = ct_min_range;
+      _ct_max_range = ct_max_range;
+    }
+
+    inline void getCTRange(uint16_t *ct_min_range, uint16_t *ct_max_range) const {
+      if (ct_min_range) { *ct_min_range = _ct_min_range; }
+      if (ct_max_range) { *ct_max_range = _ct_max_range; }
     }
 
     // get current color in XY format
@@ -536,8 +576,8 @@ class LightStateClass {
         // disable ct mode
         setColorMode(LCM_RGB);  // try deactivating CT mode, setColorMode() will check which is legal
       } else {
-        ct = (ct < 153 ? 153 : (ct > 500 ? 500 : ct));
-        _ww = changeUIntScale(ct, 153, 500, 0, 255);
+        ct = (ct < CT_MIN ? CT_MIN : (ct > CT_MAX ? CT_MAX : ct));
+        _ww = changeUIntScale(ct, _ct_min_range, _ct_max_range, 0, 255);
         _wc = 255 - _ww;
         _ct = ct;
         addCTMode();
@@ -577,7 +617,7 @@ class LightStateClass {
           _ww = changeUIntScale(w, 0, max, 0, 255);
           _wc = changeUIntScale(c, 0, max, 0, 255);
         }
-        _ct = changeUIntScale(w, 0, sum, 153, 500);
+        _ct = changeUIntScale(w, 0, sum, _ct_min_range, _ct_max_range);
         addCTMode();   // activate CT mode if needed
         if (_color_mode & LCM_CT) { _briCT = free_range ? max : (sum > 255 ? 255 : sum); }
       }
@@ -850,6 +890,15 @@ public:
     return prev;
   }
 
+  void setAlexaCTRange(bool alexa_ct_range) {
+    // depending on SetOption82, full or limited CT range
+    if (alexa_ct_range) {
+      _state->setCTRange(CT_MIN_ALEXA, CT_MAX_ALEXA);   // 200..380
+    } else {
+      _state->setCTRange(CT_MIN, CT_MAX);               // 153..500
+    }
+  }
+
   inline bool isCTRGBLinked() {
     return _ct_rgb_linked;
   }
@@ -916,8 +965,8 @@ public:
   void changeCTB(uint16_t new_ct, uint8_t briCT) {
     /* Color Temperature (https://developers.meethue.com/documentation/core-concepts)
      *
-     * ct = 153 = 2000K = Warm = CCWW = 00FF
-     * ct = 500 = 6500K = Cold = CCWW = FF00
+     * ct = 153 = 6500K = Cold = CCWW = FF00
+     * ct = 500 = 2000K = Warm = CCWW = 00FF
      */
     // don't set CT if not supported
     if ((LST_COLDWARM != Light.subtype) && (LST_RGBW > Light.subtype)) {
@@ -1002,8 +1051,8 @@ public:
         current_color[1] = w;
         break;
       case LST_RGBW:
-      case LST_RGBWC:
-        if (LST_RGBWC == Light.subtype) {
+      case LST_RGBCW:
+        if (LST_RGBCW == Light.subtype) {
           current_color[3] = c;
           current_color[4] = w;
         } else {
@@ -1110,9 +1159,20 @@ uint16_t ledGamma_internal(uint16_t v, const struct gamma_table_t *gt_ptr) {
     from_gamma = to_gamma;
   }
 }
-// 10_10 bits, fast fade mode
-uint16_t ledGamma10_10_fast(uint16_t v) {
-  return ledGamma_internal(v, gamma_table_fast);
+// Calculate the reverse gamma value for LEDS
+uint16_t ledGammaReverse_internal(uint16_t vg, const struct gamma_table_t *gt_ptr) {
+  uint16_t from_src = 0;
+  uint16_t from_gamma = 0;
+
+  for (const gamma_table_t *gt = gt_ptr; ; gt++) {
+    uint16_t to_src = gt->to_src;
+    uint16_t to_gamma = gt->to_gamma;
+    if (vg <= to_gamma) {
+      return changeUIntScale(vg, from_gamma, to_gamma, from_src, to_src);
+    }
+    from_src = to_src;
+    from_gamma = to_gamma;
+  }
 }
 
 // 10 bits in, 10 bits out
@@ -1214,6 +1274,7 @@ void LightInit(void)
 
   light_controller.setSubType(Light.subtype);
   light_controller.loadSettings();
+  light_controller.setAlexaCTRange(Settings.flag4.alexa_ct_range);
 
   if (LST_SINGLE == Light.subtype) {
     Settings.light_color[0] = 255;      // One channel only supports Dimmer but needs max color
@@ -1332,11 +1393,11 @@ void LightSetColorTemp(uint16_t ct)
 {
 /* Color Temperature (https://developers.meethue.com/documentation/core-concepts)
  *
- * ct = 153 = 2000K = Warm = CCWW = 00FF
- * ct = 500 = 6500K = Cold = CCWW = FF00
+ * ct = 153 = 6500K = Cold = CCWW = FF00
+ * ct = 600 = 2000K = Warm = CCWW = 00FF
  */
   // don't set CT if not supported
-  if ((LST_COLDWARM != Light.subtype) && (LST_RGBWC != Light.subtype)) {
+  if ((LST_COLDWARM != Light.subtype) && (LST_RGBCW != Light.subtype)) {
     return;
   }
   light_controller.changeCTB(ct, light_state.getBriCT());
@@ -1345,7 +1406,7 @@ void LightSetColorTemp(uint16_t ct)
 uint16_t LightGetColorTemp(void)
 {
   // don't calculate CT for unsupported devices
-  if ((LST_COLDWARM != Light.subtype) && (LST_RGBWC != Light.subtype)) {
+  if ((LST_COLDWARM != Light.subtype) && (LST_RGBCW != Light.subtype)) {
     return 0;
   }
   return (light_state.getColorMode() & LCM_CT) ? light_state.getCT() : 0;
@@ -1430,7 +1491,7 @@ void LightState(uint8_t append)
         ResponseAppend_P(PSTR(",\"" D_CMND_WHITE "\":%d"), light_state.getDimmer(2));
       }
       // Add CT
-      if ((LST_COLDWARM == Light.subtype) || (LST_RGBWC == Light.subtype)) {
+      if ((LST_COLDWARM == Light.subtype) || (LST_RGBCW == Light.subtype)) {
         ResponseAppend_P(PSTR(",\"" D_CMND_COLORTEMPERATURE "\":%d"), light_state.getCT());
       }
       // Add status for each channel
@@ -1551,13 +1612,21 @@ void LightCycleColor(int8_t direction)
   if (0 == direction) {
     if (Light.random == Light.wheel) {
       Light.random = random(255);
+
+      uint8_t my_dir = (Light.random < Light.wheel -128) ? 1 :
+                       (Light.random < Light.wheel     ) ? 0 :
+                       (Light.random > Light.wheel +128) ? 0 : 1;  // Increment or Decrement and roll-over
+      Light.random = (Light.random & 0xFE) | my_dir;
+
+//      AddLog_P2(LOG_LEVEL_DEBUG, PSTR("LGT: random %d"), Light.random);
     }
-    direction = (Light.random < Light.wheel) ? -1 : 1;
+//    direction = (Light.random < Light.wheel) ? -1 : 1;
+    direction = (Light.random &0x01) ? 1 : -1;
   }
   Light.wheel += direction;
   uint16_t hue = changeUIntScale(Light.wheel, 0, 255, 0, 359);  // Scale to hue to keep amount of steps low (max 255 instead of 359)
 
-//  AddLog_P2(LOG_LEVEL_DEBUG, PSTR("DBG: random %d, wheel %d, hue %d"), Light.random, Light.wheel, hue);
+//  AddLog_P2(LOG_LEVEL_DEBUG, PSTR("LGT: random %d, wheel %d, hue %d"), Light.random, Light.wheel, hue);
 
   uint8_t sat;
   light_state.getHSB(nullptr, &sat, nullptr);  // Allow user control over Saturation
@@ -1604,6 +1673,8 @@ void LightAnimate(void)
   uint16_t light_still_on = 0;
   bool power_off = false;
 
+  // make sure we update CT range in case SetOption82 was changed
+  light_controller.setAlexaCTRange(Settings.flag4.alexa_ct_range);
   Light.strip_timer_counter++;
 
   // set sleep parameter: either settings,
@@ -1698,12 +1769,9 @@ void LightAnimate(void)
         calcGammaMultiChannels(cur_col_10);
       } else {
         calcGammaBulbs(cur_col_10);
-        if (PHILIPS == my_module_type) {
-          calcGammaCTPwm(cur_col_10);
-        }
 
         // Now see if we need to mix RGB and True White
-        // Valid only for LST_RGBW, LST_RGBWC, rgbwwTable[4] is zero, and white is zero (see doc)
+        // Valid only for LST_RGBW, LST_RGBCW, rgbwwTable[4] is zero, and white is zero (see doc)
         if ((LST_RGBW <= Light.subtype) && (0 == Settings.rgbwwTable[4]) && (0 == cur_col_10[3]+cur_col_10[4])) {
           uint32_t min_rgb_10 = min3(cur_col_10[0], cur_col_10[1], cur_col_10[2]);
           for (uint32_t i=0; i<3; i++) {
@@ -1718,10 +1786,10 @@ void LightAnimate(void)
           if (LST_RGBW == Light.subtype) {
             // we simply set the white channel
             cur_col_10[3] = white_10;
-          } else {  // LST_RGBWC
+          } else {  // LST_RGBCW
             // we distribute white between cold and warm according to CT value
-            uint32_t ct = light_state.getCT();
-            cur_col_10[4] = changeUIntScale(ct, 153, 500, 0, white_10);
+            uint32_t ct = light_state.getCT10bits();
+            cur_col_10[4] = changeUIntScale(ct, 0, 1023, 0, white_10);
             cur_col_10[3] = white_10 - cur_col_10[4];
           }
         }
@@ -1740,11 +1808,12 @@ void LightAnimate(void)
         cur_col_10[i] = orig_col_10bits[Light.color_remap[i]];
       }
 
-      if (!Settings.light_fade || power_off) { // no fade
+      if (!Settings.light_fade || power_off || (!Light.fade_initialized)) { // no fade
         // record the current value for a future Fade
         memcpy(Light.fade_start_10, cur_col_10, sizeof(Light.fade_start_10));
         // push the final values at 8 and 10 bits resolution to the PWMs
         LightSetOutputs(cur_col_10);
+        Light.fade_initialized = true;      // it is now ok to fade
       } else {  // fade on
         if (Light.fade_running) {
           // if fade is running, we take the curring value as the start for the next fade
@@ -1768,6 +1837,33 @@ void LightAnimate(void)
   }
 }
 
+bool isChannelGammaCorrected(uint32_t channel) {
+  if (!Settings.light_correction) { return false; }   // Gamma correction not activated
+  if (channel >= Light.subtype) { return false; }     // Out of range
+
+  if (PHILIPS == my_module_type) {
+    if ((LST_COLDWARM == Light.subtype) && (1 == channel)) { return false; }   // PMW reserved for CT
+    if ((LST_RGBCW == Light.subtype) && (4 == channel)) { return false; }   // PMW reserved for CT
+  }
+  return true;
+}
+
+// Calculate the Gamma correction, if any, for fading, using the fast Gamma curve (10 bits in+out)
+uint16_t fadeGamma(uint32_t channel, uint16_t v) {
+  if (isChannelGammaCorrected(channel)) {
+    return ledGamma_internal(v, gamma_table_fast);
+  } else {
+    return v;
+  }
+}
+uint16_t fadeGammaReverse(uint32_t channel, uint16_t vg) {
+  if (isChannelGammaCorrected(channel)) {
+    return ledGammaReverse_internal(vg, gamma_table_fast);
+  } else {
+    return vg;
+  }
+}
+
 bool LightApplyFade(void) {   // did the value chanegd and needs to be applied
   static uint32_t last_millis = 0;
   uint32_t now = millis();
@@ -1783,7 +1879,7 @@ bool LightApplyFade(void) {   // did the value chanegd and needs to be applied
     // compute the distance between start and and color (max of distance for each channel)
     uint32_t distance = 0;
     for (uint32_t i = 0; i < Light.subtype; i++) {
-      int32_t channel_distance = Light.fade_end_10[i] - Light.fade_start_10[i];
+      int32_t channel_distance = fadeGammaReverse(i, Light.fade_end_10[i]) - fadeGammaReverse(i, Light.fade_start_10[i]);
       if (channel_distance < 0) { channel_distance = - channel_distance; }
       if (channel_distance > distance) { distance = channel_distance; }
     }
@@ -1810,9 +1906,14 @@ bool LightApplyFade(void) {   // did the value chanegd and needs to be applied
   if (fade_current <= Light.fade_duration) {    // fade not finished
     //Serial.printf("Fade: %d / %d - ", fade_current, Light.fade_duration);
     for (uint32_t i = 0; i < Light.subtype; i++) {
-      Light.fade_cur_10[i] = changeUIntScale(fade_current,
-                                              0, Light.fade_duration,
-                                              Light.fade_start_10[i], Light.fade_end_10[i]);
+      Light.fade_cur_10[i] = fadeGamma(i,
+                                changeUIntScale(fadeGammaReverse(i, fade_current),
+                                             0, Light.fade_duration,
+                                             fadeGammaReverse(i, Light.fade_start_10[i]),
+                                             fadeGammaReverse(i, Light.fade_end_10[i])));
+      // Light.fade_cur_10[i] = changeUIntScale(fade_current,
+      //                                        0, Light.fade_duration,
+      //                                        Light.fade_start_10[i], Light.fade_end_10[i]);
     }
   } else {
     // stop fade
@@ -1871,10 +1972,10 @@ void LightSetOutputs(const uint16_t *cur_col_10) {
       }
     }
   }
-  char msg[24];
-  AddLog_P2(LOG_LEVEL_DEBUG, PSTR("LGT: Channels %s"),
-            ToHex_P((const unsigned char *)cur_col_10, 10, msg, sizeof(msg)));
-  
+
+//  char msg[24];
+//  AddLog_P2(LOG_LEVEL_DEBUG, PSTR("LGT: Channels %s"), ToHex_P((const unsigned char *)cur_col_10, 10, msg, sizeof(msg)));
+
   uint8_t cur_col[LST_MAX];
   for (uint32_t i = 0; i < LST_MAX; i++) {
     cur_col[i] = change10to8(cur_col_10[i]);
@@ -1897,26 +1998,6 @@ void LightSetOutputs(const uint16_t *cur_col_10) {
   XdrvMailbox.topic = tmp_topic;
 }
 
-// Do specific computation is SetOption73 is on, Color Temp is a separate PWM channel
-void calcGammaCTPwm(uint16_t cur_col_10[5]) {
-  // Xiaomi Philips bulbs follow a different scheme:
-  uint8_t cold, warm;   // channel 1 is the color tone, mapped to cold channel (0..255)
-  light_state.getCW(&cold, &warm);
-  // channels for white are always the last two channels
-  uint32_t cw1 = Light.subtype - 1;       // address for the ColorTone PWM
-  uint32_t cw0 = Light.subtype - 2;       // address for the White Brightness PWM
-  // overall brightness
-  uint16_t pxBri10 = cur_col_10[cw0] + cur_col_10[cw1];
-  if (pxBri10 > 1023) { pxBri10 = 1023; }
-  cur_col_10[cw1] = changeUIntScale(cold, 0, cold + warm, 0, 1023);   //
-  // channel 0=intensity, channel1=temperature
-  if (Settings.light_correction) { // gamma correction
-    cur_col_10[cw0] = ledGamma10_10(pxBri10);    // 10 bits gamma correction
-  } else {
-    cur_col_10[cw0] = pxBri10;  // no gamma, extend to 10 bits
-  }
-}
-
 // Just apply basic Gamma to each channel
 void calcGammaMultiChannels(uint16_t cur_col_10[5]) {
   // Apply gamma correction for 8 and 10 bits resolutions, if needed
@@ -1931,23 +2012,34 @@ void calcGammaBulbs(uint16_t cur_col_10[5]) {
   // Apply gamma correction for 8 and 10 bits resolutions, if needed
   if (Settings.light_correction) {
     // First apply combined correction to the overall white power
-    if ((LST_COLDWARM == Light.subtype) || (LST_RGBWC == Light.subtype)) {
-      uint8_t w_idx[2] = {0, 1};        // if LST_COLDWARM, channels 0 and 1
-      if (LST_RGBWC == Light.subtype) { // if LST_RGBWC, channels 3 and 4
-        w_idx[0] = 3;
-        w_idx[1] = 4;
-      }
-      uint16_t white_bri10 = cur_col_10[w_idx[0]] + cur_col_10[w_idx[1]];
-      // if sum of both channels is > 255, then channels are probablu uncorrelated
-      if (white_bri10 <= 1023) {
-        // we calculate the gamma corrected sum of CW + WW
-        uint16_t white_bri_10bits = ledGamma10_10(white_bri10);
-        // then we split the total energy among the cold and warm leds
-        cur_col_10[w_idx[0]] = changeUIntScale(cur_col_10[w_idx[0]], 0, white_bri10, 0, white_bri_10bits);
-        cur_col_10[w_idx[1]] = changeUIntScale(cur_col_10[w_idx[1]], 0, white_bri10, 0, white_bri_10bits);
+    if ((LST_COLDWARM == Light.subtype) || (LST_RGBCW == Light.subtype)) {
+      // channels for white are always the last two channels
+      uint32_t cw1 = Light.subtype - 1;       // address for the ColorTone PWM
+      uint32_t cw0 = Light.subtype - 2;       // address for the White Brightness PWM
+      uint16_t white_bri10 = cur_col_10[cw0] + cur_col_10[cw1];   // cumulated brightness
+      uint16_t white_bri10_1023 = (white_bri10 > 1023) ? 1023 : white_bri10;    // max 1023
+
+      if (PHILIPS == my_module_type) {   // channel 1 is the color tone, mapped to cold channel (0..255)
+        // Xiaomi Philips bulbs follow a different scheme:
+        cur_col_10[cw1] = light_state.getCT10bits();
+        // channel 0=intensity, channel1=temperature
+        if (Settings.light_correction) { // gamma correction
+          cur_col_10[cw0] = ledGamma10_10(white_bri10_1023);    // 10 bits gamma correction
+        } else {
+          cur_col_10[cw0] = white_bri10_1023;  // no gamma, extend to 10 bits
+        }
       } else {
-        cur_col_10[w_idx[0]] = ledGamma10_10(cur_col_10[w_idx[0]]);
-        cur_col_10[w_idx[1]] = ledGamma10_10(cur_col_10[w_idx[1]]);
+        // if sum of both channels is > 255, then channels are probably uncorrelated
+        if (white_bri10 <= 1031) {      // take a margin of 8 above 1023 to account for rounding errors
+          // we calculate the gamma corrected sum of CW + WW
+          uint16_t white_bri_gamma10 = ledGamma10_10(white_bri10_1023);
+          // then we split the total energy among the cold and warm leds
+          cur_col_10[cw0] = changeUIntScale(cur_col_10[cw0], 0, white_bri10_1023, 0, white_bri_gamma10);
+          cur_col_10[cw1] = changeUIntScale(cur_col_10[cw1], 0, white_bri10_1023, 0, white_bri_gamma10);
+        } else {
+          cur_col_10[cw0] = ledGamma10_10(cur_col_10[cw0]);
+          cur_col_10[cw1] = ledGamma10_10(cur_col_10[cw1]);
+        }
       }
     }
     // then apply gamma correction to RGB channels
@@ -1957,7 +2049,7 @@ void calcGammaBulbs(uint16_t cur_col_10[5]) {
       }
     }
     // If RGBW or Single channel, also adjust White channel
-    if ((LST_COLDWARM != Light.subtype) && (LST_RGBWC != Light.subtype)) {
+    if ((LST_COLDWARM != Light.subtype) && (LST_RGBCW != Light.subtype)) {
       cur_col_10[3] = ledGamma10_10(cur_col_10[3]);
     }
   }
@@ -2028,7 +2120,7 @@ bool LightColorEntry(char *buffer, uint32_t buffer_length)
       memcpy_P(&Light.entry_color, &kFixedColdWarm[value -200], 2);
       entry_type = 1;                               // Hexadecimal
     }
-    else if (LST_RGBWC == Light.subtype) {
+    else if (LST_RGBCW == Light.subtype) {
       memcpy_P(&Light.entry_color[3], &kFixedColdWarm[value -200], 2);
       entry_type = 1;                               // Hexadecimal
     }
@@ -2233,7 +2325,7 @@ void CmndScheme(void)
 void CmndWakeup(void)
 {
   if ((XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 100)) {
-    Settings.light_dimmer = XdrvMailbox.payload;
+    light_controller.changeDimmer(XdrvMailbox.payload);
   }
   Light.wakeup_active = 3;
   Settings.light_scheme = LS_WAKEUP;
@@ -2244,17 +2336,17 @@ void CmndWakeup(void)
 void CmndColorTemperature(void)
 {
   if (Light.pwm_multi_channels) { return; }
-  if ((LST_COLDWARM == Light.subtype) || (LST_RGBWC == Light.subtype)) { // ColorTemp
+  if ((LST_COLDWARM == Light.subtype) || (LST_RGBCW == Light.subtype)) { // ColorTemp
     uint32_t ct = light_state.getCT();
     if (1 == XdrvMailbox.data_len) {
       if ('+' == XdrvMailbox.data[0]) {
-        XdrvMailbox.payload = (ct > (500-34)) ? 500 : ct + 34;
+        XdrvMailbox.payload = (ct > (CT_MAX-34)) ? CT_MAX : ct + 34;
       }
       else if ('-' == XdrvMailbox.data[0]) {
-        XdrvMailbox.payload = (ct < (153+34)) ? 153 : ct - 34;
+        XdrvMailbox.payload = (ct < (CT_MIN+34)) ? CT_MIN : ct - 34;
       }
     }
-    if ((XdrvMailbox.payload >= 153) && (XdrvMailbox.payload <= 500)) {  // https://developers.meethue.com/documentation/core-concepts
+    if ((XdrvMailbox.payload >= CT_MIN) && (XdrvMailbox.payload <= CT_MAX)) {  // https://developers.meethue.com/documentation/core-concepts
       light_controller.changeCTB(XdrvMailbox.payload, light_state.getBri());
       LightPreparePower(2);
     } else {
@@ -2350,7 +2442,7 @@ void CmndRgbwwTable(void)
 {
   if ((XdrvMailbox.data_len > 0)) {
     if (strstr(XdrvMailbox.data, ",") != nullptr) {  // Command with up to 5 comma separated parameters
-      for (uint32_t i = 0; i < LST_RGBWC; i++) {
+      for (uint32_t i = 0; i < LST_RGBCW; i++) {
         char *substr;
 
         if (0 == i) {
@@ -2367,7 +2459,7 @@ void CmndRgbwwTable(void)
   }
   char scolor[LIGHT_COLOR_SIZE];
   scolor[0] = '\0';
-  for (uint32_t i = 0; i < LST_RGBWC; i++) {
+  for (uint32_t i = 0; i < LST_RGBCW; i++) {
     snprintf_P(scolor, sizeof(scolor), PSTR("%s%s%d"), scolor, (i > 0) ? "," : "", Settings.rgbwwTable[i]);
   }
   ResponseCmndIdxChar(scolor);
