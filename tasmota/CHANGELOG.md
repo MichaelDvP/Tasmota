@@ -1,13 +1,28 @@
 ## Unreleased (development)
 
+### 8.1.0.8 20200212
+
+- Change MQTT message size with additional 200 characters
+- Change some wifi code to attempt faster connection (#7621)
+- Add another new DHT driver based on ESPEasy. The old driver can still be used using define USE_DHT_OLD. The previous new driver can be used with define USE_DHT_V2 (#7717)
+
+### 8.1.0.7 20200210
+
+- Add new DHT driver. The old driver can still be used using define USE_DHT_OLD (#7468)
+- Fix wrong encoding of Zigbee persistent data
+
 ### 8.1.0.6 20200205
 
 - Fix Hass sensor discovery part 1/4 by Federico Leoni (#7582, #7548)
+- Fix MaxPower functionality (#7647)
 - Add support for sensors DS18x20 and DHT family on Shelly 1 and Shelly 1PM using Shelly Add-On adapter (#7469)
 - Add commands ``SwitchMode 11`` PushHoldMulti and ``SwitchMode 12`` PushHoldInverted (#7603)
 - Add command ``Buzzer -1`` for infinite mode and command ``Buzzer -2`` for following led mode (#7623)
 - Add support for MI-BLE sensors using HM-10 Bluetooth 4.0 module by Christian Staars (#7683)
 - Add BootCount Reset Time as BCResetTime to ``Status 1``
+- Add ``ZbZNPReceived``and ``ZbZCLReceived`` being published to MQTT when ``SetOption66 1``
+- Add optional Wifi AccessPoint passphrase define WIFI_AP_PASSPHRASE in my_user_config.h (#7690)
+- Add support for FiF LE-01MR energy meter by saper-2 (#7584)
 
 ### 8.1.0.5 20200126
 
